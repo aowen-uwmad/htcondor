@@ -741,6 +741,116 @@ main( int argc, const char *argv[] )
 		NoCmdFileNeeded = true;
 	}
 
+	// Per-user rate limiting of condor_submit invocations.
+	//
+	// When SUBMIT_THROTTLE_MAX is set to a positive integer in the HTCondor
+	// config, each user is allowed at most that many condor_submit invocations
+	// within a rolling window of SUBMIT_THROTTLE_WINDOW_SECS seconds (default
+	// 60).  Excess invocations are rejected with a clear error message.
+	//
+	// Throttling is skipped in dry-run mode because no actual job is queued.
+	//
+	// Implementation notes / future TODOs:
+	//   - State is kept in a per-user file under /tmp.  On systems where /tmp
+	//     is on NFS, flock(2) may silently no-op; consider a configurable
+	//     state directory on a local filesystem (SUBMIT_THROTTLE_STATE_DIR).
+	//   - A malicious root user can delete or tamper with the state files in
+	//     /tmp.  If stronger guarantees are needed, move state to a privileged
+	//     daemon or a directory writable only by the condor user.
+	//   - Integrating this with the schedd's own submission-rate controls
+	//     would avoid the need for out-of-band state files entirely.
+	//   - Windows support would require a different locking mechanism
+	//     (e.g. LockFileEx).
+#if !defined(WIN32)
+	if ( ! DashDryRun) {
+		int throttle_max = param_integer("SUBMIT_THROTTLE_MAX", 0, 0);
+		int throttle_window = param_integer("SUBMIT_THROTTLE_WINDOW_SECS", 60, 1);
+
+		if (throttle_max > 0) {
+			uid_t uid = getuid();
+			std::string throttle_path;
+			formatstr(throttle_path, "/tmp/.condor_submit_throttle_%u", (unsigned)uid);
+
+			// O_NOFOLLOW prevents a symlink-substitution attack where an
+			// adversary pre-creates a symlink at the throttle path before the
+			// legitimate user's first submission.  On the first run the file
+			// does not yet exist, so O_CREAT creates it; on subsequent runs
+			// O_NOFOLLOW ensures we open the regular file we created earlier.
+			int tfd = open(throttle_path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+			if (tfd < 0) {
+				// Non-fatal: if we cannot open the file, log a warning but allow
+				// the submit to proceed rather than blocking legitimate users.
+				fprintf(stderr, "WARNING: condor_submit: could not open throttle "
+					"file %s: %s\n", throttle_path.c_str(), strerror(errno));
+			} else {
+				// Acquire an exclusive lock so that concurrent condor_submit
+				// processes from the same user serialize here and do not race
+				// on the state file.
+				if (flock(tfd, LOCK_EX) < 0) {
+					fprintf(stderr, "WARNING: condor_submit: could not lock "
+						"throttle file: %s\n", strerror(errno));
+					close(tfd);
+				} else {
+					// get_submit_time() is used instead of time() because the
+					// time() symbol is poisoned after line ~176 of this file.
+					time_t now = get_submit_time();
+					time_t window_start = now - (time_t)throttle_window;
+
+					// Read the state file.  Each line holds one timestamp (seconds
+					// since epoch) representing a past invocation.  We keep only
+					// entries that fall within the current window.
+					std::vector<time_t> recent;
+					{
+						// dup() so that fdopen() does not steal our lock fd.
+						int rfd = dup(tfd);
+						if (rfd >= 0) {
+							FILE *rf = fdopen(rfd, "r");
+							if (rf) {
+								long ts_raw = 0;
+								while (fscanf(rf, "%ld\n", &ts_raw) == 1) {
+									time_t ts = (time_t)ts_raw;
+									if (ts >= window_start) {
+										recent.push_back(ts);
+									}
+								}
+								fclose(rf); // also closes rfd
+							} else {
+								close(rfd);
+							}
+						}
+					}
+
+					if ((int)recent.size() >= throttle_max) {
+						fprintf(stderr,
+							"\nERROR: Submit rate limit exceeded for user %s.\n"
+							"  You may run condor_submit at most %d time(s) per"
+							" %d second(s).\n"
+							"  Please wait before submitting again.\n",
+							username ? username : "unknown",
+							throttle_max, throttle_window);
+						flock(tfd, LOCK_UN);
+						close(tfd);
+						exit(1);
+					}
+
+					// Record this invocation.
+					recent.push_back(now);
+					if (lseek(tfd, 0, SEEK_SET) == 0 && ftruncate(tfd, 0) == 0) {
+						for (time_t t : recent) {
+							char buf[32];
+							int n = snprintf(buf, sizeof(buf), "%ld\n", (long)t);
+							if (n > 0) { (void)write(tfd, buf, (size_t)n); }
+						}
+					}
+
+					flock(tfd, LOCK_UN);
+					close(tfd);
+				}
+			}
+		}
+	}
+#endif // !WIN32
+
 	if (!DisableFileChecks) {
 		DisableFileChecks = param_boolean_crufty("SUBMIT_SKIP_FILECHECKS", true) ? 1 : 0;
 	}

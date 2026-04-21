@@ -6,6 +6,7 @@ __pycache__
 
 # Project exclude paths
 /_build/
+/__build/
 
 # vscode files
 .vscode/
